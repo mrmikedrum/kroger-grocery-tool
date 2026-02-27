@@ -5,11 +5,15 @@ Usage:
   python3 kroger_tool.py stores [--zip <zip>] [--set-default N]
   python3 kroger_tool.py search <term> [--store <location_id>] [--limit N]
   python3 kroger_tool.py cart <item1> <item2> ... [--store <location_id>] [--dry-run]
+  python3 kroger_tool.py history
+  python3 kroger_tool.py remove <product_id>
 """
 import os
 import sys
+import json
 import argparse
 import warnings
+from datetime import datetime
 warnings.filterwarnings("ignore")
 
 from dotenv import load_dotenv
@@ -21,15 +25,49 @@ from kroger_api.token_storage import load_token
 DEFAULT_ZIP = os.environ.get("KROGER_USER_ZIP_CODE", "85718")
 DEFAULT_STORE_FILE = os.path.join(os.path.dirname(__file__), ".default_store")
 USER_TOKEN_FILE = ".kroger_token_user.json"
+HISTORY_FILE = os.path.join(os.path.dirname(__file__), "grocery_list.json")
+
+
+# ── History helpers ─────────────────────────────────────────────────────────
+
+def load_history():
+    if os.path.exists(HISTORY_FILE):
+        with open(HISTORY_FILE) as f:
+            return json.load(f)
+    return {}
+
+def save_history(data):
+    with open(HISTORY_FILE, "w") as f:
+        json.dump(data, f, indent=2)
+
+def record_items(items):
+    """items: list of {upc, description, price}"""
+    history = load_history()
+    for item in items:
+        upc = item["upc"]
+        if upc in history:
+            history[upc]["count"] += 1
+            history[upc]["last_added"] = datetime.now().isoformat()
+        else:
+            history[upc] = {
+                "upc": upc,
+                "description": item.get("description", ""),
+                "price": item.get("price"),
+                "count": 1,
+                "first_added": datetime.now().isoformat(),
+                "last_added": datetime.now().isoformat(),
+            }
+    save_history(history)
+
+
+# ── API helpers ──────────────────────────────────────────────────────────────
 
 def get_search_client():
-    """Client with client credentials - for product/location searches."""
     client = KrogerAPI()
     client.authorization.get_token_with_client_credentials("product.compact")
     return client
 
 def get_cart_client():
-    """Client with user token - for cart operations."""
     client = KrogerAPI()
     user_token = load_token(USER_TOKEN_FILE)
     if not user_token:
@@ -54,6 +92,9 @@ def nearest_store(client, zip_code=None):
     locs = client.location.search_locations(zip_code=zip_code or DEFAULT_ZIP, radius_in_miles=10, limit=1)
     stores = locs.get("data", [])
     return stores[0]["locationId"] if stores else None
+
+
+# ── Commands ─────────────────────────────────────────────────────────────────
 
 def cmd_stores(args):
     client = get_search_client()
@@ -103,7 +144,8 @@ def cmd_cart(args):
     search_client = get_search_client()
     store_id = args.store or get_default_store() or nearest_store(search_client)
 
-    found = []
+    found = []       # for cart API
+    to_record = []   # for history
     missing = []
     total = 0.0
 
@@ -122,12 +164,12 @@ def cmd_cart(args):
                 total += price
             print(f"  ✓  {item_name!r} → {desc}  {price_str}")
             found.append({"upc": prod_id, "quantity": 1, "modality": "PICKUP"})
+            to_record.append({"upc": prod_id, "description": desc, "price": price})
         else:
             print(f"  ✗  {item_name!r} → not found")
             missing.append(item_name)
 
     print(f"\n{len(found)} found, {len(missing)} not found  |  est. total: ${total:.2f}")
-
     if missing:
         print(f"Not found: {', '.join(missing)}")
 
@@ -141,7 +183,49 @@ def cmd_cart(args):
 
     cart_client = get_cart_client()
     cart_client.cart.add_to_cart(found)
+    record_items(to_record)
     print(f"\n✅ {len(found)} items added to your Fry's cart!")
+
+def cmd_history(args):
+    history = load_history()
+    if not history:
+        print("No history yet.")
+        return
+    # Sort by count desc, then last_added desc
+    items = sorted(history.values(), key=lambda x: (-x["count"], x["last_added"]), reverse=False)
+    print(f"{'#':<4} {'Times':>5}  {'Last Added':<12}  Description")
+    print("-" * 70)
+    for i, item in enumerate(items, 1):
+        last = item["last_added"][:10]
+        count = item["count"]
+        desc = item["description"]
+        price = f"  ${item['price']:.2f}" if item.get("price") else ""
+        print(f"  {i:<3} {count:>5}x  {last}  {desc}{price}")
+
+def cmd_remove(args):
+    history = load_history()
+    if args.product_id in history:
+        desc = history[args.product_id]["description"]
+        del history[args.product_id]
+        save_history(history)
+        print(f"✅ Removed '{desc}' from history.")
+    else:
+        # Try matching by description substring
+        matches = [(k, v) for k, v in history.items() if args.product_id.lower() in v["description"].lower()]
+        if len(matches) == 1:
+            k, v = matches[0]
+            del history[k]
+            save_history(history)
+            print(f"✅ Removed '{v['description']}' from history.")
+        elif len(matches) > 1:
+            print("Multiple matches — be more specific or use the product ID:")
+            for k, v in matches:
+                print(f"  {k}  {v['description']}")
+        else:
+            print(f"Not found: {args.product_id}")
+
+
+# ── Main ─────────────────────────────────────────────────────────────────────
 
 def main():
     parser = argparse.ArgumentParser(description="Kroger/Fry's grocery tool")
@@ -162,11 +246,18 @@ def main():
     p_cart.add_argument("--store")
     p_cart.add_argument("--dry-run", action="store_true")
 
+    sub.add_parser("history", help="Show all previously ordered items")
+
+    p_remove = sub.add_parser("remove", help="Remove item from history by product ID or name")
+    p_remove.add_argument("product_id", help="Product ID or name substring")
+
     args = parser.parse_args()
-    if args.cmd == "stores":      cmd_stores(args)
-    elif args.cmd == "search":    cmd_search(args)
-    elif args.cmd == "cart":      cmd_cart(args)
-    else:                         parser.print_help()
+    if args.cmd == "stores":        cmd_stores(args)
+    elif args.cmd == "search":      cmd_search(args)
+    elif args.cmd == "cart":        cmd_cart(args)
+    elif args.cmd == "history":     cmd_history(args)
+    elif args.cmd == "remove":      cmd_remove(args)
+    else:                           parser.print_help()
 
 if __name__ == "__main__":
     main()

@@ -12,3 +12,4 @@ __pycache__/
 *.pyo
 venv/
 .venv/
+grocery_list.json
