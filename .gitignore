@@ -1,0 +1,14 @@
+# Secrets - never commit these
+.env
+*.json
+
+# Keep these token files out
+.kroger_token_*.json
+.default_store
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+venv/
+.venv/
